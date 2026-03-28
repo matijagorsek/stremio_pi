@@ -34,7 +34,16 @@ router.post("/launch", (req, res) => {
     url,
   ];
 
-  mpvProcess = spawn("mpv", args, { detached: true, stdio: "ignore" });
+  // Pass display env so MPV can open a window when launched from pm2 (no display by default)
+  const uid = process.getuid ? process.getuid() : 1000;
+  const mpvEnv = {
+    ...process.env,
+    DISPLAY: process.env.DISPLAY || ":0",
+    WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY || "wayland-1",
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`,
+  };
+
+  mpvProcess = spawn("mpv", args, { detached: true, stdio: "ignore", env: mpvEnv });
   mpvProcess.unref();
 
   mpvProcess.on("exit", (code) => {
