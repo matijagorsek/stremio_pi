@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, height=device-height, viewport-fit=cover" />
+  <title>StremioPI</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script>
+    (function(){
+      var m = /[?&]api=([^&]+)/.exec(location.search);
+      if (m) window.StremioPI_API_BASE = decodeURIComponent(m[1].replace(/\+/g, ' '));
+    })();
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="a11y-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+    <!-- List view: catalog grid -->
+    <section id="list-view" class="view" aria-label="Catalog">
+      <header class="header">
+        <h1 class="logo">StremioPI</h1>
+        <div class="header-right">
+          <p class="hint" id="nav-hint">↑↓←→ move · Enter select · Backspace back</p>
+          <button type="button" id="open-settings-btn" class="settings-btn-header" aria-label="Settings">Settings</button>
+        </div>
+      </header>
+      <nav id="catalog-tabs" class="catalog-tabs" aria-label="Catalog type">
+        <button type="button" id="tab-all" class="catalog-tab active" data-type="all" aria-pressed="true">All</button>
+        <button type="button" id="tab-movies" class="catalog-tab" data-type="movie" aria-pressed="false">Movies</button>
+        <button type="button" id="tab-series" class="catalog-tab" data-type="series" aria-pressed="false">Series</button>
+      </nav>
+      <div id="catalog-toolbar" class="catalog-toolbar">
+        <label for="catalog-select" class="catalog-label">Catalog</label>
+        <select id="catalog-select" class="catalog-select" aria-label="Choose catalog">
+          <option value="">All catalogs</option>
+        </select>
+        <label for="search-input" class="search-label">Search</label>
+        <input type="text" id="search-input" class="search-input" placeholder="Search…" aria-label="Search" autocomplete="off" />
+        <button type="button" id="search-btn" class="search-btn">Search</button>
+      </div>
+      <div id="catalog-loading" class="loading-message hidden">Loading catalog…</div>
+      <div id="catalog-error-wrap" class="catalog-error-wrap hidden">
+        <p id="catalog-error" class="error-message" role="alert"></p>
+        <button type="button" id="catalog-retry-btn" class="catalog-retry-btn">Retry</button>
+      </div>
+      <div id="catalog-scroll" class="catalog-scroll" tabindex="0" aria-label="Catalog list">
+        <div id="catalog-grid" class="catalog-grid" role="list"></div>
+        <div id="catalog-sentinel" class="catalog-sentinel" aria-hidden="true"></div>
+      </div>
+    </section>
+
+    <!-- Detail view: one item + Play -->
+    <section id="detail-view" class="view hidden" aria-label="Details">
+      <header class="header">
+        <button type="button" id="detail-back" class="back-btn" data-action="back">← Back</button>
+      </header>
+      <div id="detail-loading" class="loading-message hidden">Loading details…</div>
+      <div id="detail-error" class="error-message hidden" role="alert"></div>
+      <div id="detail-content" class="detail-content" tabindex="0" aria-label="Details content">
+        <img id="detail-poster" class="detail-poster" src="" alt="" />
+        <div class="detail-info">
+          <h2 id="detail-title"></h2>
+          <p id="detail-meta" class="detail-meta"></p>
+          <p id="detail-description" class="detail-description"></p>
+          <div id="detail-episodes" class="detail-episodes hidden" aria-label="Episodes"></div>
+          <div id="streams-loading" class="streams-loading-pulse loading-message hidden" aria-live="polite">Loading streams…</div>
+          <button type="button" id="play-btn" class="play-btn hidden" data-action="play">▶ Play</button>
+          <div id="stream-picker" class="stream-picker hidden" aria-label="Choose stream">
+            <p class="stream-picker-title">Choose stream</p>
+            <div id="stream-picker-list" class="stream-picker-list" role="list"></div>
+          </div>
+          <p id="detail-stream-error" class="error-message hidden" role="alert"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Settings: addons -->
+    <section id="settings-view" class="view hidden" aria-label="Settings">
+      <header class="header">
+        <button type="button" id="settings-back" class="back-btn">← Back</button>
+        <h1 class="logo">Settings</h1>
+      </header>
+      <div class="settings-scroll">
+        <h2 class="settings-section-title">Addons</h2>
+        <div id="addons-loading" class="loading-message hidden">Loading addons…</div>
+        <div id="addons-error" class="error-message hidden" role="alert"></div>
+        <div id="addons-list" class="addons-list" role="list"></div>
+        <div class="settings-section add-addon-section">
+          <h3 class="settings-subtitle">Add addon</h3>
+          <p class="settings-hint">Paste the addon manifest/base URL (e.g. from configure page).</p>
+          <div class="addon-form">
+            <input type="text" id="addon-url-input" class="addon-input" placeholder="https://..." aria-label="Addon URL" />
+            <input type="text" id="addon-name-input" class="addon-input addon-name-input" placeholder="Name (optional)" aria-label="Addon name" />
+            <button type="button" id="addon-add-btn" class="addon-add-btn">Add</button>
+          </div>
+          <p id="addon-form-message" class="error-message hidden" role="alert"></p>
+        </div>
+        <div class="settings-section">
+          <h3 class="settings-subtitle">Suggested addons</h3>
+          <p class="settings-hint">Add one of these, or use your own URL from an addon's configure page.</p>
+          <div id="suggested-addons" class="suggested-addons"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Player: MPV launched fullscreen — browser shows waiting overlay -->
+    <section id="player-view" class="view hidden" aria-label="Video player">
+      <div class="mpv-overlay">
+        <div class="mpv-spinner" aria-hidden="true"></div>
+        <p class="mpv-title" id="mpv-playing-title">▶ Playing…</p>
+        <p class="mpv-hint">MPV is playing fullscreen on your TV.<br>Press <kbd>Q</kbd> on keyboard to stop.</p>
+        <button type="button" id="player-close" class="play-btn mpv-stop-btn" data-action="close-player">✕ Stop playback</button>
+      </div>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

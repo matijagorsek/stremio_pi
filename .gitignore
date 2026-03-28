@@ -1,0 +1,4 @@
+node_modules/
+backend/data/addons.json
+.env
+*.log
