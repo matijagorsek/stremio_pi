@@ -1,0 +1,30 @@
+{
+  "name": "stremio-pi",
+  "version": "1.0.0",
+  "description": "Stremio-compatible player for Raspberry Pi 5",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --linux deb --arm64",
+    "dev": "NODE_ENV=development electron ."
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "build": {
+    "appId": "com.jarvis.stremio-pi",
+    "productName": "StremioPI",
+    "directories": { "output": "dist" },
+    "files": [
+      "electron/**/*",
+      "tv-app/**/*",
+      "backend/**/*",
+      "!backend/node_modules/.cache"
+    ],
+    "linux": {
+      "target": [{ "target": "deb", "arch": ["arm64"] }],
+      "category": "AudioVideo"
+    }
+  }
+}

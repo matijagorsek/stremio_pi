@@ -632,7 +632,12 @@ function playStream(url, _type, title) {
   const mpvTitleEl = document.getElementById("mpv-playing-title");
   if (mpvTitleEl) mpvTitleEl.textContent = "▶ " + playingTitle;
 
-  apiPost("/player/launch", { url, title: playingTitle })
+  // Use Electron native IPC if running as desktop app, otherwise fall back to HTTP API
+  const launch = window.electronAPI
+    ? window.electronAPI.playStream(url, playingTitle)
+    : apiPost("/player/launch", { url, title: playingTitle });
+
+  launch
     .then(() => {
       showView("player");
       const stopBtn = document.getElementById("player-close");
@@ -648,8 +653,10 @@ function playStream(url, _type, title) {
 function destroyHls() { /* no-op: MPV handles playback */ }
 
 function closePlayer() {
-  // Stop MPV on the Pi
-  apiPost("/player/stop", {}).catch(() => {});
+  const stop = window.electronAPI
+    ? window.electronAPI.stopStream()
+    : apiPost("/player/stop", {});
+  stop.catch(() => {});
   state.currentStream = null;
   showView("detail");
   if (state.currentItem && state.currentItem.type === "series" && playBtn) playBtn.focus();
