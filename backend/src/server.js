@@ -1,5 +1,6 @@
 import "dotenv/config";
 import app from "./app.js";
+import { startElectroBot } from "./services/telegramBot.js";
 
 const PORT = Number(process.env.PORT) || 3000;
 
@@ -10,3 +11,5 @@ app.listen(PORT, () => {
   console.log(`  Stream:  GET  http://localhost:${PORT}/stream/:id`);
   console.log(`  Player:  POST http://localhost:${PORT}/player/launch`);
 });
+
+startElectroBot();
