@@ -32,10 +32,15 @@ export function launchMpv(url, title = "Electro") {
     "--force-window=yes",
     "--no-terminal",
     "--osd-level=1",
-    "--hwdec=drmprime",        // Pi 5 HEVC hardware decode via DRM PRIME
-    "--vo=gpu-next",           // gpu-next imports DRM PRIME frames zero-copy
+    // Software decode — jedino što pouzdano prikazuje sliku na Pi 5 + Wayland
+    "--hwdec=no",
+    "--vo=gpu",
     "--gpu-context=wayland",
-    "--vd-lavc-threads=4",     // fallback thread count if hwdec misses
+    "--vd-lavc-threads=4",
+    // HDR → SDR tone mapping (za HDR streamove koji bi inače bili isprani)
+    "--tone-mapping=hable",
+    "--hdr-compute-peak=no",
+    // Network buffer — manje zastajkivanja
     "--cache=yes",
     "--cache-secs=30",
     "--demuxer-max-bytes=150M",
