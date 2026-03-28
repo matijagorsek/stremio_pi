@@ -1,22 +1,27 @@
 /**
  * Electro — Telegram bot za filmove, serije i YouTube na Raspberry Pi 5.
  *
- * Komande (tekst ili glasovna poruka):
- *   pusti <film>          — traži film i nudi stream
- *   serija <naziv>        — traži seriju i nudi stream
- *   youtube <url|naziv>   — reproducira YouTube video
- *   stop / zaustavi       — zaustavlja reprodukciju
- *   1–5 / jedan–pet       — bira stream iz ponuđene liste
+ * Flow za filmove/serije:
+ *   1. Traži → nudi top 5 streamova
+ *   2. Korisnik odabire broj → počinje preuzimanje s progress barom
+ *   3. Nakon preuzimanja → MPV reproducira lokalnu datoteku
+ *   4. MPV exit 4 (kraj filma) → datoteka se briše
+ *   5. MPV exit 0 (korisnik zaustavio) → datoteka ostaje, pozicija pamti se
+ *   6. Isti film drugi put → nudi nastavak ili iznova
+ *
+ * Komande: pusti <film> | serija <naziv> | youtube <url|naziv> | stop | 1–5
  */
 
 import TelegramBot from "node-telegram-bot-api";
 import { execFile, execFileSync } from "child_process";
-import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "fs";
-import { join } from "path";
+import { writeFileSync, unlinkSync, existsSync, readdirSync, mkdirSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import { tmpdir } from "os";
 import { getEnabledAddons } from "./addonStore.js";
 import { getAddonSearch, getAddonStreams, getAddonMeta } from "./addonClient.js";
 import { launchMpv, stopMpv } from "./playerService.js";
+import { DOWNLOADS_DIR, safeFilename, downloadFile } from "./downloadService.js";
 
 const TOKEN    = process.env.ELECTRO_BOT_TOKEN;
 const OWNER_ID = process.env.ELECTRO_OWNER_ID ? Number(process.env.ELECTRO_OWNER_ID) : null;
@@ -25,9 +30,12 @@ if (!TOKEN) {
   console.warn("[Electro] ELECTRO_BOT_TOKEN nije postavljen — bot se ne pokreće.");
 }
 
-// ─── Pending stream selections ────────────────────────────────────────────────
-/** chatId → { streams, title, type, timer } */
-const pending = new Map();
+// ─── State maps ───────────────────────────────────────────────────────────────
+/** chatId → { streams, title, streamId, posterUrl, timer } */
+const pendingSelection = new Map();
+
+/** chatId → { controller, filePath, title } — active download */
+const activeDownloads = new Map();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -35,15 +43,28 @@ function esc(t) {
   return String(t || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Croatian + English number words → 1-5, or parse digit string */
+function progressBar(pct) {
+  const filled = Math.min(10, Math.round((pct || 0) / 10));
+  return "█".repeat(filled) + "░".repeat(10 - filled);
+}
+
+function fmtBytes(b) {
+  if (b >= 1073741824) return (b / 1073741824).toFixed(1) + " GB";
+  if (b >= 1048576)    return Math.round(b / 1048576) + " MB";
+  return Math.round(b / 1024) + " KB";
+}
+
+/** Croatian + English number words → 1-5 */
 function parseChoice(text) {
   const t = text.trim().toLowerCase();
-  const words = { jedan: 1, jedna: 1, one: 1, "1": 1,
-                  dva: 2, dvije: 2, two: 2, "2": 2,
-                  tri: 3, three: 3, "3": 3,
-                  četiri: 4, cetiri: 4, four: 4, "4": 4,
-                  pet: 5, five: 5, "5": 5 };
-  if (words[t]) return words[t];
+  const words = {
+    jedan: 1, jedna: 1, one: 1, "1": 1,
+    dva: 2, dvije: 2, two: 2, "2": 2,
+    tri: 3, three: 3, "3": 3,
+    četiri: 4, cetiri: 4, four: 4, "4": 4,
+    pet: 5, five: 5, "5": 5,
+  };
+  if (words[t] !== undefined) return words[t];
   const n = parseInt(t, 10);
   return n >= 1 && n <= 5 ? n : null;
 }
@@ -62,10 +83,7 @@ function qualityLabel(s) {
   return res + codec;
 }
 
-/**
- * Pi 5 ima hardware HEVC decode → preferiramo HEVC streamove.
- * Redoslijed: 1080p HEVC → 720p HEVC → 1080p h264 → 720p h264 → ostalo → 4K
- */
+/** Sort: Pi 5 hw HEVC → 1080p HEVC, 720p HEVC, 1080p h264, 720p h264, ?, 4K */
 function sortStreams(streams) {
   const score = (s) => {
     const n = (s.name || "").toLowerCase();
@@ -83,6 +101,204 @@ function sortStreams(streams) {
     return 4;
   };
   return [...streams].sort((a, b) => score(a) - score(b));
+}
+
+/** Find downloaded file for a given stream id */
+function findDownload(streamId) {
+  try {
+    const files = readdirSync(DOWNLOADS_DIR);
+    const match = files.find((f) => f.endsWith(`__${streamId}.mp4`));
+    return match ? join(DOWNLOADS_DIR, match) : null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Telegram message helpers ─────────────────────────────────────────────────
+
+async function editCaption(bot, chatId, msgId, text, isPhoto) {
+  if (!msgId) return;
+  try {
+    if (isPhoto) {
+      await bot.editMessageCaption(text, { chat_id: chatId, message_id: msgId, parse_mode: "HTML" });
+    } else {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "HTML" });
+    }
+  } catch {}
+}
+
+/** Send poster image (if url provided) or text message. Returns { msgId, isPhoto } */
+async function sendProgressMsg(bot, chatId, posterUrl, caption) {
+  try {
+    if (posterUrl) {
+      const sent = await bot.sendPhoto(chatId, posterUrl, { caption, parse_mode: "HTML" });
+      return { msgId: sent.message_id, isPhoto: true };
+    }
+  } catch {}
+  // Fallback: send as text
+  const sent = await bot.sendMessage(chatId, caption, { parse_mode: "HTML" });
+  return { msgId: sent.message_id, isPhoto: false };
+}
+
+// ─── Download + Play flow ─────────────────────────────────────────────────────
+
+async function downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl) {
+  const filename = safeFilename(title, streamId);
+  const destPath = join(DOWNLOADS_DIR, filename);
+  const controller = new AbortController();
+
+  activeDownloads.set(chatId, { controller, filePath: destPath, title });
+
+  // 1. Send initial progress message
+  const { msgId, isPhoto } = await sendProgressMsg(bot, chatId, posterUrl,
+    `⬇️ <b>${esc(title)}</b>\n\n${progressBar(0)} 0%\nPočinje preuzimanje…`
+  );
+
+  // 2. Download
+  let lastEditTime = 0;
+  try {
+    await downloadFile(stream.url, destPath, {
+      signal: controller.signal,
+      onProgress: (dl, total) => {
+        const now = Date.now();
+        if (now - lastEditTime < 4000) return; // max 1 update per 4 seconds
+        lastEditTime = now;
+        const pct = total > 0 ? Math.round(dl / total * 100) : null;
+        const dlStr = fmtBytes(dl) + (total > 0 ? ` / ${fmtBytes(total)}` : "");
+        const bar = progressBar(pct ?? 50);
+        const caption = `⬇️ <b>${esc(title)}</b>\n\n${bar} ${pct != null ? pct + "%" : "…"}\n${dlStr}`;
+        editCaption(bot, chatId, msgId, caption, isPhoto);
+      },
+    });
+  } catch (err) {
+    activeDownloads.delete(chatId);
+    const msg = err.message.includes("otkazano")
+      ? `⏹ <b>Preuzimanje otkazano.</b>`
+      : `❌ Greška pri preuzimanju:\n${esc(err.message)}`;
+    await editCaption(bot, chatId, msgId, msg, isPhoto);
+    return;
+  }
+
+  activeDownloads.delete(chatId);
+  console.log(`[Electro] Preuzimanje gotovo: ${destPath}`);
+
+  // 3. Play
+  await editCaption(bot, chatId, msgId,
+    `▶️ <b>${esc(title)}</b>\n\nReproducira se… 🎬`,
+    isPhoto
+  );
+
+  launchMpv(destPath, title, (exitCode) => {
+    if (exitCode === 4) {
+      // Film završen prirodno — obriši datoteku
+      try { unlinkSync(destPath); } catch {}
+      bot.sendMessage(chatId,
+        `✅ <b>${esc(title)}</b> — kraj filma!\nDatoteka obrisana.`,
+        { parse_mode: "HTML" }
+      ).catch(() => {});
+      console.log(`[Electro] Film završen, datoteka obrisana: ${destPath}`);
+    } else if (exitCode === 0) {
+      // Korisnik zaustavio — datoteka ostaje, pozicija pamti se automatski
+      bot.sendMessage(chatId,
+        `⏸ <b>${esc(title)}</b> — pauzirano.\nSljedeći put nastavljam od iste pozicije.`,
+        { parse_mode: "HTML" }
+      ).catch(() => {});
+    }
+  });
+}
+
+// ─── Core search + stream flow ────────────────────────────────────────────────
+
+async function playFlow(bot, chatId, query, type) {
+  const addons = getEnabledAddons();
+  if (addons.length === 0) {
+    return bot.sendMessage(chatId, "❌ Nema dodanih addona.", { parse_mode: "HTML" });
+  }
+
+  await bot.sendMessage(chatId, `🔍 Tražim <b>${esc(query)}</b>…`, { parse_mode: "HTML" });
+
+  const results = await getAddonSearch(addons, type, query);
+  if (!results || results.length === 0) {
+    return bot.sendMessage(chatId, `❌ Ništa pronađeno za <b>${esc(query)}</b>.`, { parse_mode: "HTML" });
+  }
+
+  const item  = results[0];
+  const label = item.title || item.name || query;
+  const posterUrl = item.poster || null;
+  console.log(`[Electro] Pronađeno: ${label} (${item.id})`);
+
+  await bot.sendMessage(chatId, `🎬 <b>${esc(label)}</b>\n⏳ Dohvaćam streamove…`, { parse_mode: "HTML" });
+
+  // Resolve IMDB id for movies (Torrentio+RD needs it)
+  let streamId = item.id;
+  if (type === "movie") {
+    const meta = await getAddonMeta(addons, "movie", item.id).catch(() => null);
+    if (meta && meta.imdbId) streamId = meta.imdbId;
+  }
+
+  const streams = await getAddonStreams(addons, type, streamId);
+  if (!streams || streams.length === 0) {
+    return bot.sendMessage(chatId, `❌ Nema streamova za <b>${esc(label)}</b>.`, { parse_mode: "HTML" });
+  }
+
+  const sorted = sortStreams(streams);
+
+  // If only one stream → skip selection
+  if (sorted.length === 1) {
+    return startDownloadFlow(bot, chatId, sorted[0], label, streamId, posterUrl);
+  }
+
+  const top5 = sorted.slice(0, 5);
+  const lines = top5.map((s, i) => {
+    const q    = qualityLabel(s);
+    const name = (s.name || "Stream").replace(/\n/g, " ").slice(0, 50);
+    return `${i + 1}. <b>${q}</b> — ${esc(name)}`;
+  });
+
+  clearPending(chatId);
+
+  const timer = setTimeout(() => {
+    pendingSelection.delete(chatId);
+    bot.sendMessage(chatId, "⏱ Isteklo vrijeme odabira.").catch(() => {});
+  }, 90_000);
+
+  pendingSelection.set(chatId, { streams: top5, title: label, streamId, posterUrl, timer });
+
+  await bot.sendMessage(chatId,
+    `🎬 <b>${esc(label)}</b>\n\nOdaberi stream (1–${top5.length}):\n\n${lines.join("\n")}`,
+    { parse_mode: "HTML" }
+  );
+}
+
+async function startDownloadFlow(bot, chatId, stream, title, streamId, posterUrl) {
+  // Check if already downloaded
+  const existing = findDownload(streamId);
+  if (existing && existsSync(existing)) {
+    clearPending(chatId);
+    const timer = setTimeout(() => {
+      pendingSelection.delete(chatId);
+    }, 30_000);
+    pendingSelection.set(chatId, {
+      _resumeChoice: true,
+      filePath: existing,
+      title,
+      streamId,
+      stream,
+      posterUrl,
+      timer,
+    });
+    return bot.sendMessage(chatId,
+      `📂 <b>${esc(title)}</b> je već preuzet!\n\n1. Nastavi od zadnje pozicije\n2. Preuzmi iznova`,
+      { parse_mode: "HTML" }
+    );
+  }
+
+  await downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl);
+}
+
+function clearPending(chatId) {
+  const p = pendingSelection.get(chatId);
+  if (p) { clearTimeout(p.timer); pendingSelection.delete(chatId); }
 }
 
 // ─── Whisper transcription ────────────────────────────────────────────────────
@@ -110,24 +326,19 @@ function transcribeAudio(wavPath) {
 async function handleVoice(bot, msg) {
   const chatId = msg.chat.id;
   const stamp  = Date.now();
-  const tmp    = tmpdir();
-  const oggPath = join(tmp, `electro_${stamp}.ogg`);
-  const wavPath = join(tmp, `electro_${stamp}.wav`);
+  const oggPath = join(tmpdir(), `electro_${stamp}.ogg`);
+  const wavPath = join(tmpdir(), `electro_${stamp}.wav`);
 
   try {
     await bot.sendMessage(chatId, "🎙️ Slušam…");
 
-    // 1. Download OGG
     const fileLink = await bot.getFileLink(msg.voice.file_id);
     const res = await fetch(fileLink);
     if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    writeFileSync(oggPath, buf);
+    writeFileSync(oggPath, Buffer.from(await res.arrayBuffer()));
 
-    // 2. OGG → WAV 16kHz mono (Whisper format)
     execFileSync("ffmpeg", ["-y", "-i", oggPath, "-ar", "16000", "-ac", "1", wavPath], { stdio: "pipe" });
 
-    // 3. Whisper transcription
     const text = await transcribeAudio(wavPath);
     console.log(`[Electro] 🎙️ Transkripcija: "${text}"`);
 
@@ -137,8 +348,6 @@ async function handleVoice(bot, msg) {
     }
 
     await bot.sendMessage(chatId, `🎙️ <i>${esc(text)}</i>`, { parse_mode: "HTML" });
-
-    // 4. Process transcribed text as a regular command
     await handleText(bot, chatId, text);
 
   } catch (err) {
@@ -171,130 +380,85 @@ function ytdlpGetUrl(query) {
   });
 }
 
-// ─── Core search + stream flow ────────────────────────────────────────────────
-
-async function playFlow(bot, chatId, query, type) {
-  const addons = getEnabledAddons();
-  if (addons.length === 0) {
-    return bot.sendMessage(chatId, "❌ Nema dodanih addona.", { parse_mode: "HTML" });
-  }
-
-  await bot.sendMessage(chatId, `🔍 Tražim <b>${esc(query)}</b>…`, { parse_mode: "HTML" });
-
-  const results = await getAddonSearch(addons, type, query);
-  if (!results || results.length === 0) {
-    return bot.sendMessage(chatId, `❌ Ništa pronađeno za <b>${esc(query)}</b>.`, { parse_mode: "HTML" });
-  }
-
-  const item  = results[0];
-  const label = item.title || item.name || query;
-  console.log(`[Electro] Pronađeno: ${label} (${item.id})`);
-
-  await bot.sendMessage(chatId, `🎬 <b>${esc(label)}</b>\n⏳ Dohvaćam streamove…`, { parse_mode: "HTML" });
-
-  // Resolve IMDB id for movies (Torrentio+RD needs it)
-  let streamId = item.id;
-  if (type === "movie") {
-    const meta = await getAddonMeta(addons, "movie", item.id).catch(() => null);
-    if (meta && meta.imdbId) streamId = meta.imdbId;
-  }
-
-  const streams = await getAddonStreams(addons, type, streamId);
-  if (!streams || streams.length === 0) {
-    return bot.sendMessage(chatId, `❌ Nema streamova za <b>${esc(label)}</b>.`, { parse_mode: "HTML" });
-  }
-
-  const sorted = sortStreams(streams);
-
-  if (sorted.length === 1) {
-    return launchStream(bot, chatId, sorted[0], label);
-  }
-
-  const top5 = sorted.slice(0, 5);
-  const lines = top5.map((s, i) => {
-    const q    = qualityLabel(s);
-    const name = (s.name || "Stream").replace(/\n/g, " ").slice(0, 50);
-    return `${i + 1}. <b>${q}</b> — ${esc(name)}`;
-  });
-
-  clearPending(chatId);
-
-  const timer = setTimeout(() => {
-    pending.delete(chatId);
-    bot.sendMessage(chatId, "⏱ Isteklo vrijeme odabira.").catch(() => {});
-  }, 90_000);
-
-  pending.set(chatId, { streams: top5, title: label, type, timer });
-
-  await bot.sendMessage(chatId,
-    `🎬 <b>${esc(label)}</b>\n\nOdaberi stream (odgovori brojem 1–${top5.length}):\n\n${lines.join("\n")}`,
-    { parse_mode: "HTML" }
-  );
-}
-
-async function launchStream(bot, chatId, stream, title) {
-  try {
-    launchMpv(stream.url, title);
-    await bot.sendMessage(chatId,
-      `▶️ <b>Reproducira se!</b>\n\n🎬 ${esc(title)}\n📺 ${esc(stream.name || "Stream")}`,
-      { parse_mode: "HTML" }
-    );
-  } catch (err) {
-    await bot.sendMessage(chatId, `❌ Greška pri pokretanju: ${esc(err.message)}`);
-  }
-}
-
-function clearPending(chatId) {
-  const p = pending.get(chatId);
-  if (p) { clearTimeout(p.timer); pending.delete(chatId); }
-}
-
 // ─── Text command router ──────────────────────────────────────────────────────
 
 async function handleText(bot, chatId, text) {
   const lower = text.toLowerCase().trim();
 
-  // Stop
-  if (/\b(stop|zaustavi|ugasi|kraj|pauza)\b/i.test(lower)) {
+  // ── Stop / Cancel ─────────────────────────────────────────────────────────
+  if (/\b(stop|zaustavi|ugasi|kraj|pauza|cancel|odustani)\b/i.test(lower)) {
     clearPending(chatId);
+
+    // Cancel active download
+    if (activeDownloads.has(chatId)) {
+      const dl = activeDownloads.get(chatId);
+      dl.controller.abort();
+      activeDownloads.delete(chatId);
+      return bot.sendMessage(chatId, `⏹ Preuzimanje <b>${esc(dl.title)}</b> otkazano.`, { parse_mode: "HTML" });
+    }
+
     const stopped = stopMpv();
     return bot.sendMessage(chatId, stopped ? "⏹ Reprodukcija zaustavljena." : "ℹ️ Ništa se ne reproducira.");
   }
 
-  // Stream selection (pending list)
+  // ── Resume/Restart choice (1 or 2) ───────────────────────────────────────
+  const p = pendingSelection.get(chatId);
+  if (p?._resumeChoice) {
+    const n = parseChoice(lower);
+    if (n === 1) {
+      clearPending(chatId);
+      launchMpv(p.filePath, p.title, (exitCode) => {
+        if (exitCode === 4) {
+          try { unlinkSync(p.filePath); } catch {}
+          bot.sendMessage(chatId, `✅ <b>${esc(p.title)}</b> — kraj filma! Datoteka obrisana.`, { parse_mode: "HTML" }).catch(() => {});
+        } else if (exitCode === 0) {
+          bot.sendMessage(chatId, `⏸ <b>${esc(p.title)}</b> — pauzirano.`, { parse_mode: "HTML" }).catch(() => {});
+        }
+      });
+      return bot.sendMessage(chatId, `▶️ Nastavljam <b>${esc(p.title)}</b>…`, { parse_mode: "HTML" });
+    }
+    if (n === 2) {
+      clearPending(chatId);
+      try { unlinkSync(p.filePath); } catch {}
+      return downloadAndPlay(bot, chatId, p.stream, p.title, p.streamId, p.posterUrl);
+    }
+    return; // ignore other input while waiting for 1/2
+  }
+
+  // ── Stream selection (1-5) ────────────────────────────────────────────────
   const choice = parseChoice(lower);
-  if (choice !== null && pending.has(chatId)) {
-    const p = pending.get(chatId);
+  if (choice !== null && p && !p._resumeChoice) {
     clearPending(chatId);
     const stream = p.streams[choice - 1];
     if (!stream) return bot.sendMessage(chatId, `❌ Nema streama broj ${choice}.`);
-    return launchStream(bot, chatId, stream, p.title);
+    return startDownloadFlow(bot, chatId, stream, p.title, p.streamId, p.posterUrl);
   }
 
-  // YouTube
+  // ── YouTube ───────────────────────────────────────────────────────────────
   const ytMatch = text.match(/^(?:youtube|yt)\s+(.+)/i);
   if (ytMatch) {
     const query = ytMatch[1].trim();
-    await bot.sendMessage(chatId, `📺 YouTube: <b>${esc(query)}</b>\n⏳ Dohvaćam link…`, { parse_mode: "HTML" });
+    await bot.sendMessage(chatId, `📺 <b>${esc(query)}</b>\n⏳ Dohvaćam YouTube link…`, { parse_mode: "HTML" });
     try {
       const url = await ytdlpGetUrl(query);
+      // YouTube plays directly (no download — streams can't be saved easily)
       launchMpv(url, query);
-      await bot.sendMessage(chatId, `▶️ <b>YouTube reproducira!</b>\n\n📺 ${esc(query)}`, { parse_mode: "HTML" });
+      await bot.sendMessage(chatId, `▶️ <b>YouTube</b>\n\n📺 ${esc(query)}`, { parse_mode: "HTML" });
     } catch (err) {
       await bot.sendMessage(chatId, `❌ yt-dlp greška: ${esc(err.message)}`);
     }
     return;
   }
 
-  // Serija
+  // ── Serija ────────────────────────────────────────────────────────────────
   const showMatch = text.match(/^(?:serija|series|show)\s+(.+)/i);
   if (showMatch) return playFlow(bot, chatId, showMatch[1].trim(), "series");
 
-  // Film
+  // ── Film ──────────────────────────────────────────────────────────────────
   const movieMatch = text.match(/^(?:pusti|play|film|movie)\s+(.+)/i);
   if (movieMatch) return playFlow(bot, chatId, movieMatch[1].trim(), "movie");
 
-  // /start
+  // ── /start ────────────────────────────────────────────────────────────────
   if (lower === "/start") {
     return bot.sendMessage(chatId,
       "👋 <b>Electro</b> — tvoj Pi 5 stream player\n\n" +
@@ -302,18 +466,17 @@ async function handleText(bot, chatId, text) {
       "📺 <code>serija Breaking Bad</code>\n" +
       "▶️ <code>youtube https://youtu.be/...</code>\n" +
       "🎙️ Glasovne poruke rade isto!\n" +
-      "⏹ <code>stop</code> — zaustavi reprodukciju",
+      "⏹ <code>stop</code> — zaustavi / otkaži preuzimanje",
       { parse_mode: "HTML" }
     );
   }
 }
 
-// ─── Message handler (dispatcher) ────────────────────────────────────────────
+// ─── Message dispatcher ───────────────────────────────────────────────────────
 
 function handleMessage(bot, msg) {
   const chatId = msg.chat.id;
 
-  // Owner-only guard
   if (OWNER_ID && msg.from.id !== OWNER_ID) {
     return bot.sendMessage(chatId, "⛔ Pristup odbijen.");
   }
@@ -342,7 +505,6 @@ export function startElectroBot() {
   console.log("[Electro] Bot pokrenut (polling).");
 
   bot.on("message", (msg) => handleMessage(bot, msg));
-
   bot.on("polling_error", (err) =>
     console.error("[Electro] Polling greška:", err.message || err)
   );
