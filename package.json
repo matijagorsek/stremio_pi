@@ -5,6 +5,8 @@
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
+    "start:web": "node backend/src/server.js",
+    "start:kiosk": "node backend/src/server.js & sleep 3 && chromium-browser --kiosk --noerrdialogs --disable-infobars --no-first-run --ozone-platform=wayland http://localhost:3000",
     "build": "electron-builder --linux deb --arm64",
     "dev": "NODE_ENV=development electron ."
   },
