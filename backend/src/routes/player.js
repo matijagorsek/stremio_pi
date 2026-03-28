@@ -30,9 +30,17 @@ router.post("/launch", (req, res) => {
     "--force-window=yes",
     "--no-terminal",
     "--osd-level=1",
-    "--hwdec=auto",          // hardware decoding (V4L2 on Pi 5)
-    "--vo=gpu",              // GPU video output
-    "--profile=fast",        // optimise for performance over quality
+    // Pi 5: HEVC hardware decode via V4L2 Request API → DRM PRIME buffers
+    // gpu-next can zero-copy import DRM PRIME frames over Wayland
+    "--hwdec=drmprime",
+    "--vo=gpu-next",
+    "--gpu-context=wayland",
+    "--vd-lavc-threads=4",   // used as fallback if hwdec fails
+    // Network / streaming buffer — reduce stutter on slow links
+    "--cache=yes",
+    "--cache-secs=30",
+    "--demuxer-max-bytes=150M",
+    "--demuxer-readahead-secs=20",
     `--title=${title || "StremioPI"}`,
     url,
   ];
@@ -42,7 +50,7 @@ router.post("/launch", (req, res) => {
   const mpvEnv = {
     ...process.env,
     DISPLAY: process.env.DISPLAY || ":0",
-    WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY || "wayland-1",
+    WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY || "wayland-0",   // Pi 5 Wayfire socket
     XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`,
   };
 
