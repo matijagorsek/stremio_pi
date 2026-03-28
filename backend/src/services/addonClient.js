@@ -239,8 +239,18 @@ export function getAddonStreams(addons, type, id) {
     });
     console.log("[StremioPI] Addons returned " + rawStreams.length + " stream(s): " + httpStreams.length + " HTTP, " + torrentStreams.length + " torrent.");
     if (torrentStreams.length === 0 || !isDebridEnabled()) return httpStreams;
+    // Sort torrent streams: prefer 1080p, then 720p, then others (avoid 4K on Pi)
+    const qualityScore = (s) => {
+      const n = (s.name || s.title || '').toLowerCase();
+      if (n.includes('1080p')) return 0;
+      if (n.includes('720p'))  return 1;
+      if (n.includes('480p'))  return 2;
+      if (n.includes('4k') || n.includes('2160p')) return 4;
+      return 3;
+    };
+    const sortedTorrents = [...torrentStreams].sort((a, b) => qualityScore(a) - qualityScore(b));
     const maxResolve = 5;
-    const toResolve = torrentStreams.slice(0, maxResolve);
+    const toResolve = sortedTorrents.slice(0, maxResolve);
     console.log("[StremioPI] Resolving up to " + toResolve.length + " torrent stream(s) via Real-Debrid (rate-limited)...");
     const getInfoHash = (s) => s.infoHash || s.info_hash || infoHashFromMagnet(s.url);
     const fileIdx = (s) => (s.fileIdx != null ? s.fileIdx : s.file_idx != null ? s.file_idx : null);

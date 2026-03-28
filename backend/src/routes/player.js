@@ -30,6 +30,9 @@ router.post("/launch", (req, res) => {
     "--force-window=yes",
     "--no-terminal",
     "--osd-level=1",
+    "--hwdec=auto",          // hardware decoding (V4L2 on Pi 5)
+    "--vo=gpu",              // GPU video output
+    "--profile=fast",        // optimise for performance over quality
     `--title=${title || "StremioPI"}`,
     url,
   ];
