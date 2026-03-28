@@ -140,7 +140,12 @@ async function sendProgressMsg(bot, chatId, posterUrl, caption) {
   return { msgId: sent.message_id, isPhoto: false };
 }
 
-// ─── Download + Play flow ─────────────────────────────────────────────────────
+// ─── Download + Play flow (progressive) ──────────────────────────────────────
+// Skida u pozadini dok MPV reproducira — kao streaming service.
+// MPV se pokreće čim se skupi dovoljno buffer-a (100 MB), ostatak se skida paralelno.
+
+/** Bytes buffered before starting playback (100 MB — ~30-60s video) */
+const BUFFER_BYTES = 100 * 1024 * 1024;
 
 async function downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl) {
   const filename = safeFilename(title, streamId);
@@ -149,62 +154,111 @@ async function downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl) 
 
   activeDownloads.set(chatId, { controller, filePath: destPath, title });
 
-  // 1. Send initial progress message
+  // 1. Pošalji inicijalnu progress poruku s posterom
   const { msgId, isPhoto } = await sendProgressMsg(bot, chatId, posterUrl,
-    `⬇️ <b>${esc(title)}</b>\n\n${progressBar(0)} 0%\nPočinje preuzimanje…`
+    `📡 <b>${esc(title)}</b>\n\n${progressBar(0)} Buffering…\nPričekaj trenutak…`
   );
 
-  // 2. Download
-  let lastEditTime = 0;
+  let mpvLaunched   = false;
+  let downloadDone  = false;
+  let lastEditTime  = 0;
+
+  // Što napraviti kad MPV izađe
+  const onMpvExit = (exitCode) => {
+    if (exitCode === 4) {
+      // Film završio prirodno → cancel download ako još ide, obriši datoteku
+      controller.abort();
+      setTimeout(() => { try { unlinkSync(destPath); } catch {} }, 1000);
+      bot.sendMessage(chatId,
+        `✅ <b>${esc(title)}</b> — kraj filma! Datoteka obrisana.`,
+        { parse_mode: "HTML" }
+      ).catch(() => {});
+    } else if (exitCode === 0) {
+      // Korisnik zaustavio → datoteka ostaje, pozicija pamti se automatski
+      // Nastavi download u pozadini (koristi se za resume)
+      if (!downloadDone) {
+        bot.sendMessage(chatId,
+          `⏸ <b>${esc(title)}</b> — pauzirano.\nPreuzimanje nastavlja u pozadini za brži resume.`,
+          { parse_mode: "HTML" }
+        ).catch(() => {});
+      } else {
+        bot.sendMessage(chatId,
+          `⏸ <b>${esc(title)}</b> — pauzirano. Resume kad budeš spreman.`,
+          { parse_mode: "HTML" }
+        ).catch(() => {});
+      }
+    }
+  };
+
+  // 2. Počni skidanje i prati napredak
+  const onProgress = (dl, total) => {
+    // Pokreni MPV čim imamo dovoljno buffera (ili odmah ako je datoteka mala)
+    const bufferThreshold = total > 0 && total < BUFFER_BYTES * 2
+      ? Math.round(total * 0.3)   // za male datoteke: čekaj 30%
+      : BUFFER_BYTES;
+
+    if (!mpvLaunched && dl >= bufferThreshold) {
+      mpvLaunched = true;
+      console.log(`[Electro] Buffer dostignut (${fmtBytes(dl)}) — pokrećem MPV`);
+      launchMpv(destPath, title, onMpvExit);
+      editCaption(bot, chatId, msgId,
+        `▶️ <b>${esc(title)}</b>\n\n${progressBar(total > 0 ? Math.round(dl/total*100) : 10)} Reproducira se!\n${fmtBytes(dl)} / ${total > 0 ? fmtBytes(total) : "?"} — skida se u pozadini`,
+        isPhoto
+      );
+      return;
+    }
+
+    // Throttle Telegram updates
+    const now = Date.now();
+    if (now - lastEditTime < 4000) return;
+    lastEditTime = now;
+
+    const pct    = total > 0 ? Math.round(dl / total * 100) : null;
+    const dlStr  = fmtBytes(dl) + (total > 0 ? ` / ${fmtBytes(total)}` : "");
+    const bar    = progressBar(pct ?? 50);
+
+    if (mpvLaunched) {
+      // Reproducira se + skida u pozadini
+      editCaption(bot, chatId, msgId,
+        `▶️ <b>${esc(title)}</b>\n\n${bar} ${pct != null ? pct + "%" : "…"}\n${dlStr} — pozadina`,
+        isPhoto
+      );
+    } else {
+      // Još buffering
+      editCaption(bot, chatId, msgId,
+        `📡 <b>${esc(title)}</b>\n\n${bar} ${pct != null ? pct + "%" : "…"}\n${dlStr}\nBuffering…`,
+        isPhoto
+      );
+    }
+  };
+
   try {
-    await downloadFile(stream.url, destPath, {
-      signal: controller.signal,
-      onProgress: (dl, total) => {
-        const now = Date.now();
-        if (now - lastEditTime < 4000) return; // max 1 update per 4 seconds
-        lastEditTime = now;
-        const pct = total > 0 ? Math.round(dl / total * 100) : null;
-        const dlStr = fmtBytes(dl) + (total > 0 ? ` / ${fmtBytes(total)}` : "");
-        const bar = progressBar(pct ?? 50);
-        const caption = `⬇️ <b>${esc(title)}</b>\n\n${bar} ${pct != null ? pct + "%" : "…"}\n${dlStr}`;
-        editCaption(bot, chatId, msgId, caption, isPhoto);
-      },
-    });
+    await downloadFile(stream.url, destPath, { signal: controller.signal, onProgress });
+    downloadDone = true;
+    activeDownloads.delete(chatId);
+    console.log(`[Electro] Preuzimanje gotovo: ${destPath}`);
+
+    if (!mpvLaunched) {
+      // Mala datoteka — pokreni MPV sad
+      launchMpv(destPath, title, onMpvExit);
+      await editCaption(bot, chatId, msgId, `▶️ <b>${esc(title)}</b>\n\nReproducira se! 🎬`, isPhoto);
+    } else {
+      // Obavijesti da je download gotov
+      await editCaption(bot, chatId, msgId,
+        `▶️ <b>${esc(title)}</b>\n\n${progressBar(100)} 100% — preuzeto!\nReproducira se 🎬`,
+        isPhoto
+      );
+    }
   } catch (err) {
     activeDownloads.delete(chatId);
-    const msg = err.message.includes("otkazano")
-      ? `⏹ <b>Preuzimanje otkazano.</b>`
-      : `❌ Greška pri preuzimanju:\n${esc(err.message)}`;
-    await editCaption(bot, chatId, msgId, msg, isPhoto);
-    return;
-  }
-
-  activeDownloads.delete(chatId);
-  console.log(`[Electro] Preuzimanje gotovo: ${destPath}`);
-
-  // 3. Play
-  await editCaption(bot, chatId, msgId,
-    `▶️ <b>${esc(title)}</b>\n\nReproducira se… 🎬`,
-    isPhoto
-  );
-
-  launchMpv(destPath, title, (exitCode) => {
-    if (exitCode === 4) {
-      // Film završen prirodno — obriši datoteku
-      try { unlinkSync(destPath); } catch {}
-      bot.sendMessage(chatId,
-        `✅ <b>${esc(title)}</b> — kraj filma!\nDatoteka obrisana.`,
-        { parse_mode: "HTML" }
-      ).catch(() => {});
-      console.log(`[Electro] Film završen, datoteka obrisana: ${destPath}`);
-    } else if (exitCode === 0) {
-      // Korisnik zaustavio — datoteka ostaje, pozicija pamti se automatski
-      bot.sendMessage(chatId,
-        `⏸ <b>${esc(title)}</b> — pauzirano.\nSljedeći put nastavljam od iste pozicije.`,
-        { parse_mode: "HTML" }
-      ).catch(() => {});
+    // Ne prikazuj "otkazano" grešku ako je MPV već pokrenut (normalan kraj filma)
+    if (!mpvLaunched || !err.message.includes("otkazano")) {
+      const msg = err.message.includes("otkazano")
+        ? `⏹ <b>Preuzimanje otkazano.</b>`
+        : `❌ Greška pri preuzimanju:\n${esc(err.message)}`;
+      await editCaption(bot, chatId, msgId, msg, isPhoto);
     }
-  });
+  }
 }
 
 // ─── Core search + stream flow ────────────────────────────────────────────────
