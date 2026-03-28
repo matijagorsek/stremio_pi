@@ -1,7 +1,7 @@
 /**
  * Electro — Telegram bot za filmove, serije i YouTube na Raspberry Pi 5.
  *
- * Komande:
+ * Komande (tekst ili glasovna poruka):
  *   pusti <film>          — traži film i nudi stream
  *   serija <naziv>        — traži seriju i nudi stream
  *   youtube <url|naziv>   — reproducira YouTube video
@@ -10,7 +10,10 @@
  */
 
 import TelegramBot from "node-telegram-bot-api";
-import { execFile } from "child_process";
+import { execFile, execFileSync } from "child_process";
+import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { getEnabledAddons } from "./addonStore.js";
 import { getAddonSearch, getAddonStreams, getAddonMeta } from "./addonClient.js";
 import { launchMpv, stopMpv } from "./playerService.js";
@@ -82,11 +85,76 @@ function sortStreams(streams) {
   return [...streams].sort((a, b) => score(a) - score(b));
 }
 
+// ─── Whisper transcription ────────────────────────────────────────────────────
+
+function transcribeAudio(wavPath) {
+  return new Promise((resolve, reject) => {
+    const pyScript =
+      `import sys\n` +
+      `from faster_whisper import WhisperModel\n` +
+      `m = WhisperModel("base", device="cpu", compute_type="int8")\n` +
+      `segs, _ = m.transcribe(sys.argv[1], beam_size=5)\n` +
+      `print(" ".join(s.text for s in segs).strip())\n`;
+
+    const pyPath = join(tmpdir(), `electro_whisper_${Date.now()}.py`);
+    writeFileSync(pyPath, pyScript);
+
+    execFile("python3", [pyPath, wavPath], { timeout: 30000 }, (err, stdout, stderr) => {
+      try { unlinkSync(pyPath); } catch {}
+      if (err) return reject(new Error(stderr?.trim() || err.message));
+      resolve(stdout.trim());
+    });
+  });
+}
+
+async function handleVoice(bot, msg) {
+  const chatId = msg.chat.id;
+  const stamp  = Date.now();
+  const tmp    = tmpdir();
+  const oggPath = join(tmp, `electro_${stamp}.ogg`);
+  const wavPath = join(tmp, `electro_${stamp}.wav`);
+
+  try {
+    await bot.sendMessage(chatId, "🎙️ Slušam…");
+
+    // 1. Download OGG
+    const fileLink = await bot.getFileLink(msg.voice.file_id);
+    const res = await fetch(fileLink);
+    if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    writeFileSync(oggPath, buf);
+
+    // 2. OGG → WAV 16kHz mono (Whisper format)
+    execFileSync("ffmpeg", ["-y", "-i", oggPath, "-ar", "16000", "-ac", "1", wavPath], { stdio: "pipe" });
+
+    // 3. Whisper transcription
+    const text = await transcribeAudio(wavPath);
+    console.log(`[Electro] 🎙️ Transkripcija: "${text}"`);
+
+    if (!text) {
+      await bot.sendMessage(chatId, "🤔 Nisam razumio — pokušaj ponovo.");
+      return;
+    }
+
+    await bot.sendMessage(chatId, `🎙️ <i>${esc(text)}</i>`, { parse_mode: "HTML" });
+
+    // 4. Process transcribed text as a regular command
+    await handleText(bot, chatId, text);
+
+  } catch (err) {
+    console.error("[Electro] Voice error:", err.message);
+    await bot.sendMessage(chatId, `❌ Greška: ${esc(err.message)}`);
+  } finally {
+    for (const p of [oggPath, wavPath]) {
+      try { if (existsSync(p)) unlinkSync(p); } catch {}
+    }
+  }
+}
+
 // ─── YouTube via yt-dlp ───────────────────────────────────────────────────────
 
 function ytdlpGetUrl(query) {
   return new Promise((resolve, reject) => {
-    // If query looks like a URL, use it directly; otherwise treat as search
     const isUrl = /^https?:\/\//i.test(query);
     const target = isUrl ? query : `ytsearch1:${query}`;
     execFile("yt-dlp", [
@@ -98,7 +166,6 @@ function ytdlpGetUrl(query) {
       if (err) return reject(new Error(stderr?.trim() || err.message));
       const urls = stdout.trim().split("\n").filter(Boolean);
       if (urls.length === 0) return reject(new Error("yt-dlp nije vratio URL"));
-      // yt-dlp may return video+audio on separate lines — use first (video), MPV handles it
       resolve(urls[0]);
     });
   });
@@ -109,7 +176,7 @@ function ytdlpGetUrl(query) {
 async function playFlow(bot, chatId, query, type) {
   const addons = getEnabledAddons();
   if (addons.length === 0) {
-    return bot.sendMessage(chatId, "❌ Nema dodanih addona. Dodaj ih u <b>Podešavanja</b>.", { parse_mode: "HTML" });
+    return bot.sendMessage(chatId, "❌ Nema dodanih addona.", { parse_mode: "HTML" });
   }
 
   await bot.sendMessage(chatId, `🔍 Tražim <b>${esc(query)}</b>…`, { parse_mode: "HTML" });
@@ -119,13 +186,13 @@ async function playFlow(bot, chatId, query, type) {
     return bot.sendMessage(chatId, `❌ Ništa pronađeno za <b>${esc(query)}</b>.`, { parse_mode: "HTML" });
   }
 
-  const item = results[0];
+  const item  = results[0];
   const label = item.title || item.name || query;
   console.log(`[Electro] Pronađeno: ${label} (${item.id})`);
 
   await bot.sendMessage(chatId, `🎬 <b>${esc(label)}</b>\n⏳ Dohvaćam streamove…`, { parse_mode: "HTML" });
 
-  // Resolve IMDB id for movies (Torrentio needs it)
+  // Resolve IMDB id for movies (Torrentio+RD needs it)
   let streamId = item.id;
   if (type === "movie") {
     const meta = await getAddonMeta(addons, "movie", item.id).catch(() => null);
@@ -140,8 +207,7 @@ async function playFlow(bot, chatId, query, type) {
   const sorted = sortStreams(streams);
 
   if (sorted.length === 1) {
-    await launchStream(bot, chatId, sorted[0], label);
-    return;
+    return launchStream(bot, chatId, sorted[0], label);
   }
 
   const top5 = sorted.slice(0, 5);
@@ -151,7 +217,6 @@ async function playFlow(bot, chatId, query, type) {
     return `${i + 1}. <b>${q}</b> — ${esc(name)}`;
   });
 
-  // Clear previous pending for this chat
   clearPending(chatId);
 
   const timer = setTimeout(() => {
@@ -184,29 +249,19 @@ function clearPending(chatId) {
   if (p) { clearTimeout(p.timer); pending.delete(chatId); }
 }
 
-// ─── Message handler ──────────────────────────────────────────────────────────
+// ─── Text command router ──────────────────────────────────────────────────────
 
-function handleMessage(bot, msg) {
-  const chatId = msg.chat.id;
-  const text   = (msg.text || "").trim();
+async function handleText(bot, chatId, text) {
+  const lower = text.toLowerCase().trim();
 
-  // Owner-only guard (optional)
-  if (OWNER_ID && msg.from.id !== OWNER_ID) {
-    return bot.sendMessage(chatId, "⛔ Pristup odbijen.");
-  }
-
-  if (!text) return;
-
-  const lower = text.toLowerCase();
-
-  // ── Stop ─────────────────────────────────────────────────────────────────
-  if (/^(stop|zaustavi|ugasi|kraj|pauza)$/i.test(lower)) {
+  // Stop
+  if (/\b(stop|zaustavi|ugasi|kraj|pauza)\b/i.test(lower)) {
     clearPending(chatId);
     const stopped = stopMpv();
     return bot.sendMessage(chatId, stopped ? "⏹ Reprodukcija zaustavljena." : "ℹ️ Ništa se ne reproducira.");
   }
 
-  // ── Stream selection (1-5 or word) ───────────────────────────────────────
+  // Stream selection (pending list)
   const choice = parseChoice(lower);
   if (choice !== null && pending.has(chatId)) {
     const p = pending.get(chatId);
@@ -216,43 +271,66 @@ function handleMessage(bot, msg) {
     return launchStream(bot, chatId, stream, p.title);
   }
 
-  // ── YouTube ───────────────────────────────────────────────────────────────
+  // YouTube
   const ytMatch = text.match(/^(?:youtube|yt)\s+(.+)/i);
   if (ytMatch) {
     const query = ytMatch[1].trim();
-    bot.sendMessage(chatId, `📺 YouTube: <b>${esc(query)}</b>\n⏳ Dohvaćam link…`, { parse_mode: "HTML" })
-      .then(() => ytdlpGetUrl(query))
-      .then((url) => {
-        launchMpv(url, query);
-        return bot.sendMessage(chatId, `▶️ <b>YouTube reproducira!</b>\n\n📺 ${esc(query)}`, { parse_mode: "HTML" });
-      })
-      .catch((err) => bot.sendMessage(chatId, `❌ yt-dlp greška: ${esc(err.message)}`));
+    await bot.sendMessage(chatId, `📺 YouTube: <b>${esc(query)}</b>\n⏳ Dohvaćam link…`, { parse_mode: "HTML" });
+    try {
+      const url = await ytdlpGetUrl(query);
+      launchMpv(url, query);
+      await bot.sendMessage(chatId, `▶️ <b>YouTube reproducira!</b>\n\n📺 ${esc(query)}`, { parse_mode: "HTML" });
+    } catch (err) {
+      await bot.sendMessage(chatId, `❌ yt-dlp greška: ${esc(err.message)}`);
+    }
     return;
   }
 
-  // ── Serija ────────────────────────────────────────────────────────────────
+  // Serija
   const showMatch = text.match(/^(?:serija|series|show)\s+(.+)/i);
-  if (showMatch) {
-    return playFlow(bot, chatId, showMatch[1].trim(), "series");
-  }
+  if (showMatch) return playFlow(bot, chatId, showMatch[1].trim(), "series");
 
-  // ── Film (pusti / play) ───────────────────────────────────────────────────
+  // Film
   const movieMatch = text.match(/^(?:pusti|play|film|movie)\s+(.+)/i);
-  if (movieMatch) {
-    return playFlow(bot, chatId, movieMatch[1].trim(), "movie");
-  }
+  if (movieMatch) return playFlow(bot, chatId, movieMatch[1].trim(), "movie");
 
-  // ── /start ────────────────────────────────────────────────────────────────
+  // /start
   if (lower === "/start") {
     return bot.sendMessage(chatId,
       "👋 <b>Electro</b> — tvoj Pi 5 stream player\n\n" +
       "🎬 <code>pusti Inception</code>\n" +
       "📺 <code>serija Breaking Bad</code>\n" +
       "▶️ <code>youtube https://youtu.be/...</code>\n" +
+      "🎙️ Glasovne poruke rade isto!\n" +
       "⏹ <code>stop</code> — zaustavi reprodukciju",
       { parse_mode: "HTML" }
     );
   }
+}
+
+// ─── Message handler (dispatcher) ────────────────────────────────────────────
+
+function handleMessage(bot, msg) {
+  const chatId = msg.chat.id;
+
+  // Owner-only guard
+  if (OWNER_ID && msg.from.id !== OWNER_ID) {
+    return bot.sendMessage(chatId, "⛔ Pristup odbijen.");
+  }
+
+  if (msg.voice) {
+    handleVoice(bot, msg).catch((err) =>
+      console.error("[Electro] handleVoice unhandled:", err.message)
+    );
+    return;
+  }
+
+  const text = (msg.text || "").trim();
+  if (!text) return;
+
+  handleText(bot, chatId, text).catch((err) =>
+    console.error("[Electro] handleText unhandled:", err.message)
+  );
 }
 
 // ─── Bot init ─────────────────────────────────────────────────────────────────
@@ -263,13 +341,11 @@ export function startElectroBot() {
   const bot = new TelegramBot(TOKEN, { polling: true });
   console.log("[Electro] Bot pokrenut (polling).");
 
-  bot.on("message", (msg) => {
-    handleMessage(bot, msg);
-  });
+  bot.on("message", (msg) => handleMessage(bot, msg));
 
-  bot.on("polling_error", (err) => {
-    console.error("[Electro] Polling greška:", err.message || err);
-  });
+  bot.on("polling_error", (err) =>
+    console.error("[Electro] Polling greška:", err.message || err)
+  );
 
   return bot;
 }
