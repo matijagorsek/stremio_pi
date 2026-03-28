@@ -249,12 +249,12 @@ export function getAddonStreams(addons, type, id) {
       return 3;
     };
     const sortedTorrents = [...torrentStreams].sort((a, b) => qualityScore(a) - qualityScore(b));
-    const maxResolve = 5;
+    const maxResolve = 3;  // resolve fewer → faster response (3×700ms ≈ 2s vs 5×1500ms ≈ 7s)
     const toResolve = sortedTorrents.slice(0, maxResolve);
-    console.log("[StremioPI] Resolving up to " + toResolve.length + " torrent stream(s) via Real-Debrid (rate-limited)...");
+    console.log("[StremioPI] Resolving up to " + toResolve.length + " torrent stream(s) via Real-Debrid...");
     const getInfoHash = (s) => s.infoHash || s.info_hash || infoHashFromMagnet(s.url);
     const fileIdx = (s) => (s.fileIdx != null ? s.fileIdx : s.file_idx != null ? s.file_idx : null);
-    const delayMs = 1500;
+    const delayMs = 700;  // reduced from 1500ms
     const resolveOne = (s) => {
       const hash = getInfoHash(s);
       if (!hash) return Promise.resolve(null);
