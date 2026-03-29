@@ -19,8 +19,8 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { tmpdir } from "os";
 import { getEnabledAddons } from "./addonStore.js";
-import { getAddonSearch, getAddonStreams, getAddonMeta } from "./addonClient.js";
-import { launchMpv, stopMpv } from "./playerService.js";
+import { getAddonSearch, getAddonStreams, getAddonMeta, getAddonSubtitles } from "./addonClient.js";
+import { launchMpv, stopMpv, pauseMpv, getMpvProgress, isMpvRunning } from "./playerService.js";
 import { DOWNLOADS_DIR, safeFilename, downloadFile } from "./downloadService.js";
 
 const TOKEN    = process.env.ELECTRO_BOT_TOKEN;
@@ -52,6 +52,32 @@ function fmtBytes(b) {
   if (b >= 1073741824) return (b / 1073741824).toFixed(1) + " GB";
   if (b >= 1048576)    return Math.round(b / 1048576) + " MB";
   return Math.round(b / 1024) + " KB";
+}
+
+function fmtTime(secs) {
+  if (!secs || isNaN(secs)) return "--:--";
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+/** Fetch best subtitle (Croatian first, then English) for given type/id */
+async function fetchSubtitle(addons, type, id) {
+  try {
+    const subs = await getAddonSubtitles(addons, type, id);
+    if (!subs || subs.length === 0) return null;
+    const pref = ["hrv", "cro", "hr", "eng", "en"];
+    for (const lang of pref) {
+      const sub = subs.find((s) => s.lang?.toLowerCase().startsWith(lang));
+      if (sub?.url) return sub.url;
+    }
+    return subs[0]?.url || null;
+  } catch {
+    return null;
+  }
 }
 
 /** Croatian + English number words → 1-5 */
@@ -170,7 +196,7 @@ async function sendProgressMsg(bot, chatId, posterUrl, caption) {
 /** Bytes buffered before starting playback (100 MB — ~30-60s video) */
 const BUFFER_BYTES = 100 * 1024 * 1024;
 
-async function downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl) {
+async function downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl, subFiles = []) {
   const filename = safeFilename(title, streamId);
   const destPath = join(DOWNLOADS_DIR, filename);
   const controller = new AbortController();
@@ -223,7 +249,7 @@ async function downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl) 
     if (!mpvLaunched && dl >= bufferThreshold) {
       mpvLaunched = true;
       console.log(`[Electro] Buffer dostignut (${fmtBytes(dl)}) — pokrećem MPV`);
-      launchMpv(destPath, title, onMpvExit);
+      launchMpv(destPath, title, onMpvExit, subFiles);
       editCaption(bot, chatId, msgId,
         `▶️ <b>${esc(title)}</b>\n\n${progressBar(total > 0 ? Math.round(dl/total*100) : 10)} Reproducira se!\n${fmtBytes(dl)} / ${total > 0 ? fmtBytes(total) : "?"} — skida se u pozadini`,
         isPhoto
@@ -263,7 +289,7 @@ async function downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl) 
 
     if (!mpvLaunched) {
       // Mala datoteka — pokreni MPV sad
-      launchMpv(destPath, title, onMpvExit);
+      launchMpv(destPath, title, onMpvExit, subFiles);
       await editCaption(bot, chatId, msgId, `▶️ <b>${esc(title)}</b>\n\nReproducira se! 🎬`, isPhoto);
     } else {
       // Obavijesti da je download gotov
@@ -339,6 +365,8 @@ async function playFlow(bot, chatId, query, type) {
     bot.sendMessage(chatId, "⏱ Isteklo vrijeme odabira.").catch(() => {});
   }, 90_000);
 
+  // Tag each stream with content type so subtitle fetch knows movie vs series
+  top5.forEach((s) => { s._type = type; });
   pendingSelection.set(chatId, { streams: top5, title: label, streamId, posterUrl, timer });
 
   await bot.sendMessage(chatId,
@@ -370,7 +398,14 @@ async function startDownloadFlow(bot, chatId, stream, title, streamId, posterUrl
     );
   }
 
-  await downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl);
+  // Fetch subtitles in background (Croatian first, then English)
+  const addons = getEnabledAddons();
+  const type   = stream._type || "movie";
+  const subUrl = await fetchSubtitle(addons, type, streamId).catch(() => null);
+  const subFiles = subUrl ? [subUrl] : [];
+  if (subUrl) console.log(`[Electro] Titlovi: ${subUrl.slice(0, 80)}`);
+
+  await downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl, subFiles);
 }
 
 function clearPending(chatId) {
@@ -462,8 +497,28 @@ function ytdlpGetUrl(query) {
 async function handleText(bot, chatId, text) {
   const lower = text.toLowerCase().trim();
 
+  // ── Pause / Resume ────────────────────────────────────────────────────────
+  if (/^(pauziraj|pause|pauza|nastavi|resume|unpause)$/i.test(lower)) {
+    if (!isMpvRunning()) return bot.sendMessage(chatId, "ℹ️ Ništa se ne reproducira.");
+    const isPaused = await pauseMpv();
+    return bot.sendMessage(chatId, isPaused ? "⏸ Pauzirano." : "▶️ Nastavljam.");
+  }
+
+  // ── Progress ──────────────────────────────────────────────────────────────
+  if (/^(napredak|progress|gdje|koliko|status)$/i.test(lower)) {
+    if (!isMpvRunning()) return bot.sendMessage(chatId, "ℹ️ Ništa se ne reproducira.");
+    const { position, duration, paused } = await getMpvProgress();
+    if (position == null) return bot.sendMessage(chatId, "ℹ️ Ne mogu dohvatiti poziciju.");
+    const pct = duration > 0 ? Math.round(position / duration * 100) : null;
+    const bar = pct != null ? progressBar(pct) : "░░░░░░░░░░";
+    const icon = paused ? "⏸" : "▶️";
+    return bot.sendMessage(chatId,
+      `${icon} ${fmtTime(position)} / ${fmtTime(duration)}\n${bar} ${pct != null ? pct + "%" : ""}`,
+    );
+  }
+
   // ── Stop / Cancel ─────────────────────────────────────────────────────────
-  if (/\b(stop|zaustavi|ugasi|kraj|pauza|cancel|odustani)\b/i.test(lower)) {
+  if (/\b(stop|zaustavi|ugasi|kraj|cancel|odustani)\b/i.test(lower)) {
     clearPending(chatId);
 
     // Cancel active download
