@@ -13,6 +13,7 @@ import searchRoutes from "./routes/search.js";
 import playerRoutes from "./routes/player.js";
 import youtubeRoutes from "./routes/youtube.js";
 import voiceRoutes   from "./routes/voice.js";
+import remoteRoutes  from "./routes/remote.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,6 +32,7 @@ app.use("/search", searchRoutes);
 app.use("/player", playerRoutes);
 app.use("/youtube", youtubeRoutes);
 app.use("/voice",   voiceRoutes);
+app.use("/remote",  remoteRoutes);
 
 // Serve TV app static files
 const tvAppDir = path.join(__dirname, "../../tv-app");
