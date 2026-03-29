@@ -2,8 +2,10 @@
   "addons": [
     { "id": 1, "baseUrl": "https://v3-cinemeta.strem.io/", "name": "Cinemeta", "enabled": true },
     { "id": 2, "baseUrl": "https://torrentio.strem.fun/qualityfilter=4k,dolbyvision,hdr|realdebrid=VGZK3WRNH2R3NM2RA7VNCEOGQB5H2S55AOK3IALWAQUM6UUZ5TKQ/", "name": "Torrentio+RD", "enabled": true },
+    { "id": 5, "baseUrl": "https://comet.elfhosted.com/eyJkZWJyaWRTZXJ2aWNlIjoicmVhbGRlYnJpZCIsImRlYnJpZEFwaUtleSI6IlZHWkszV1JOSDJSM05NMlJBN1ZOQ0VPR1FCNUgyUzU1QU9LM0lBTFdBUVVNNlVVWjVUS1EiLCJkZWJyaWRTdHJlYW1Qcm94eVBhc3N3b3JkIjoiIn0=/", "name": "Comet+RD", "enabled": true },
+    { "id": 6, "baseUrl": "https://mediafusion.elfhosted.com/D-1km3rlqdiLFfNVTFD3BCRsUbRtczkim4klnuiQIsR5M6xmWt-T79J9yvce_CMtdXK1OBWnPyvYjo3f4gAVorjNdPHuYiuEoxBz1RNb-hSHzt9FaZ1BMa-WNtSyDuJiw6XwZbX7SxIjXQiIHrfwotrhrcUYfb-YUmq9s6PH42fzpY_JfDsJ7slcxSU4-jh8USgmrYqoY5FsM3m92pOWrhVC6T_vH5gd-kB0aXuu6EUt8/", "name": "MediaFusion+RD", "enabled": true },
     { "id": 3, "baseUrl": "https://94c8cb9f702d-tmdb-addon.baby-beamup.club/", "name": "TMDB", "enabled": true },
     { "id": 4, "baseUrl": "https://opensubtitles-v3.strem.io/", "name": "OpenSubtitles v3", "enabled": true }
   ],
-  "nextId": 5
+  "nextId": 7
 }
