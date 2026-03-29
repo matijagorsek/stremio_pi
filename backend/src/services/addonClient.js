@@ -68,7 +68,13 @@ function mapStream(s) {
   const url = s.url;
   if (!url || !url.startsWith("http") || url.startsWith("magnet:")) return null;
   const type = url.includes(".m3u8") ? "hls" : url.includes(".mp4") || url.match(/\.mp4(\?|$)/) ? "mp4" : "hls";
-  return { name: s.name || s.title || "Stream", url, type };
+  return {
+    name: s.name || s.title || "Stream",
+    title: s.title || "",
+    behaviorHints: s.behaviorHints || {},
+    url,
+    type,
+  };
 }
 
 /** Extract BTIH (infoHash) from magnet link, or return null */
