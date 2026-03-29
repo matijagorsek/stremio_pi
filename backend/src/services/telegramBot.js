@@ -69,35 +69,58 @@ function parseChoice(text) {
   return n >= 1 && n <= 5 ? n : null;
 }
 
-/** Quality + codec label, e.g. "1080p HEVC" */
+/**
+ * Torrentio+RD puts codec info in `title` and `behaviorHints.filename`, NOT in `name`.
+ * name = "[RD+] Torrentio\n1080p"
+ * title = "The Dark Knight 1080p BluRay x264 - 1.7GB"
+ * behaviorHints.filename = "Batman.The.Dark.Knight.2008.1080p.BluRay.x264.YIFY.mp4"
+ */
+function streamText(s) {
+  return [
+    s.name || "",
+    s.title || "",
+    s.behaviorHints?.filename || "",
+    s.behaviorHints?.bingeGroup || "",
+  ].join(" ").toLowerCase();
+}
+
+/** Quality + codec label, e.g. "1080p x264" */
 function qualityLabel(s) {
-  const n = (s.name || "").toLowerCase();
+  const n = streamText(s);
   const res  = n.includes("4k") || n.includes("2160p") ? "4K"
              : n.includes("1080p") ? "1080p"
              : n.includes("720p")  ? "720p"
              : n.includes("480p")  ? "480p"
              : "?";
   const codec = n.includes("hevc") || n.includes("x265") || n.includes("h265") ? " HEVC"
-              : n.includes("x264") || n.includes("h264") || n.includes("avc")   ? " h264"
+              : n.includes("x264") || n.includes("h264") || n.includes("avc")   ? " x264"
               : "";
   return res + codec;
 }
 
-/** Sort: Pi 5 hw HEVC → 1080p HEVC, 720p HEVC, 1080p h264, 720p h264, ?, 4K */
+/** Display label from title (torrent name) — more informative than name */
+function streamDisplayName(s) {
+  // title has full torrent info, strip the first line (movie title) if too long
+  const t = (s.title || s.name || "Stream").split("\n")[0].trim();
+  return t.slice(0, 55);
+}
+
+/** Sort: prefer x264 1080p (confirmed working on Pi 5), then 720p, avoid 4K/HDR/HEVC */
 function sortStreams(streams) {
   const score = (s) => {
-    const n = (s.name || "").toLowerCase();
+    const n = streamText(s);
     const is4k   = n.includes("4k") || n.includes("2160p");
     const is1080 = n.includes("1080p");
     const is720  = n.includes("720p");
     const is480  = n.includes("480p");
     const isHevc = n.includes("hevc") || n.includes("x265") || n.includes("h265");
-    if (is4k)             return 10;
-    if (is1080 && isHevc) return 0;
-    if (is720  && isHevc) return 1;
-    if (is1080)           return 2;
-    if (is720)            return 3;
-    if (is480)            return 5;
+    const isHdr  = n.includes("hdr") || n.includes("dolby") || n.includes(" dv");
+    if (is4k || isHdr)    return 10; // skip — Pi 5 can't handle
+    if (is1080 && !isHevc) return 0; // x264 1080p — best confirmed
+    if (is720  && !isHevc) return 1; // x264 720p
+    if (is1080 && isHevc)  return 2; // HEVC 1080p — maybe works
+    if (is720  && isHevc)  return 3; // HEVC 720p
+    if (is480)             return 5;
     return 4;
   };
   return [...streams].sort((a, b) => score(a) - score(b));
@@ -305,7 +328,7 @@ async function playFlow(bot, chatId, query, type) {
   const top5 = sorted.slice(0, 5);
   const lines = top5.map((s, i) => {
     const q    = qualityLabel(s);
-    const name = (s.name || "Stream").replace(/\n/g, " ").slice(0, 50);
+    const name = streamDisplayName(s);
     return `${i + 1}. <b>${q}</b> — ${esc(name)}`;
   });
 

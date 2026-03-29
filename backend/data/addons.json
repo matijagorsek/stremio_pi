@@ -1,7 +1,7 @@
 {
   "addons": [
     { "id": 1, "baseUrl": "https://v3-cinemeta.strem.io/", "name": "Cinemeta", "enabled": true },
-    { "id": 2, "baseUrl": "https://torrentio.strem.fun/qualityfilter=4k,dolbyvision,hdr,hevc|realdebrid=VGZK3WRNH2R3NM2RA7VNCEOGQB5H2S55AOK3IALWAQUM6UUZ5TKQ/", "name": "Torrentio+RD", "enabled": true },
+    { "id": 2, "baseUrl": "https://torrentio.strem.fun/qualityfilter=4k,dolbyvision,hdr|realdebrid=VGZK3WRNH2R3NM2RA7VNCEOGQB5H2S55AOK3IALWAQUM6UUZ5TKQ/", "name": "Torrentio+RD", "enabled": true },
     { "id": 3, "baseUrl": "https://94c8cb9f702d-tmdb-addon.baby-beamup.club/", "name": "TMDB", "enabled": true },
     { "id": 4, "baseUrl": "https://opensubtitles-v3.strem.io/", "name": "OpenSubtitles v3", "enabled": true }
   ],
