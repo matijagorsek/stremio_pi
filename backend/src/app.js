@@ -11,6 +11,7 @@ import healthRoutes from "./routes/health.js";
 import addonsRoutes from "./routes/addons.js";
 import searchRoutes from "./routes/search.js";
 import playerRoutes from "./routes/player.js";
+import youtubeRoutes from "./routes/youtube.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -27,6 +28,7 @@ app.use("/health", healthRoutes);
 app.use("/addons", addonsRoutes);
 app.use("/search", searchRoutes);
 app.use("/player", playerRoutes);
+app.use("/youtube", youtubeRoutes);
 
 // Serve TV app static files
 const tvAppDir = path.join(__dirname, "../../tv-app");
