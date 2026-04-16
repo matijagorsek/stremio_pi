@@ -21,7 +21,7 @@ import { tmpdir } from "os";
 import { getEnabledAddons } from "./addonStore.js";
 import { getAddonSearch, getAddonStreams, getAddonMeta, getAddonSubtitles } from "./addonClient.js";
 import { launchMpv, stopMpv, pauseMpv, getMpvProgress, isMpvRunning } from "./playerService.js";
-import { DOWNLOADS_DIR, safeFilename, downloadFile } from "./downloadService.js";
+import { DOWNLOADS_DIR, safeFilename, safeDestPath, downloadFile } from "./downloadService.js";
 
 const TOKEN    = process.env.ELECTRO_BOT_TOKEN;
 const OWNER_ID = process.env.ELECTRO_OWNER_ID ? Number(process.env.ELECTRO_OWNER_ID) : null;
@@ -198,7 +198,7 @@ const BUFFER_BYTES = 100 * 1024 * 1024;
 
 async function downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl, subFiles = []) {
   const filename = safeFilename(title, streamId);
-  const destPath = join(DOWNLOADS_DIR, filename);
+  const destPath = safeDestPath(filename);
   const controller = new AbortController();
 
   activeDownloads.set(chatId, { controller, filePath: destPath, title });

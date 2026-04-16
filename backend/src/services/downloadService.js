@@ -3,7 +3,7 @@
  * Downloads go to backend/downloads/ (configurable via DOWNLOADS_DIR env var).
  */
 import { createWriteStream, existsSync, mkdirSync, unlinkSync } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, resolve, sep } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -13,13 +13,20 @@ export const DOWNLOADS_DIR =
 
 if (!existsSync(DOWNLOADS_DIR)) mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
+const clean = (s) => String(s).replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 50);
+
 /** Sanitize title + id to a safe .mp4 filename */
 export function safeFilename(title, id) {
-  const safe = String(title)
-    .replace(/[<>:"/\\|?*]/g, "")
-    .replace(/\s+/g, "_")
-    .slice(0, 50);
-  return `${safe}__${id}.mp4`;
+  return `${clean(title)}__${clean(id)}.mp4`;
+}
+
+/** Resolve destPath and assert it stays inside DOWNLOADS_DIR */
+export function safeDestPath(filename) {
+  const dest = resolve(DOWNLOADS_DIR, filename);
+  if (!dest.startsWith(resolve(DOWNLOADS_DIR) + sep)) {
+    throw new Error("Path traversal detected");
+  }
+  return dest;
 }
 
 /**
