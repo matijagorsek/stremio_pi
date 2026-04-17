@@ -197,8 +197,7 @@ async function sendProgressMsg(bot, chatId, posterUrl, caption) {
 const BUFFER_BYTES = 100 * 1024 * 1024;
 
 async function downloadAndPlay(bot, chatId, stream, title, streamId, posterUrl, subFiles = []) {
-  const filename = safeFilename(title, streamId);
-  const destPath = join(DOWNLOADS_DIR, filename);
+  const destPath = safeFilename(title, streamId);
   const controller = new AbortController();
 
   activeDownloads.set(chatId, { controller, filePath: destPath, title });
