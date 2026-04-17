@@ -25,6 +25,9 @@ import { DOWNLOADS_DIR, safeFilename, downloadFile } from "./downloadService.js"
 
 const TOKEN    = process.env.ELECTRO_BOT_TOKEN;
 const OWNER_ID = process.env.ELECTRO_OWNER_ID ? Number(process.env.ELECTRO_OWNER_ID) : null;
+const ALLOWED  = new Set(
+  (process.env.TELEGRAM_ALLOWED_CHAT_IDS || '').split(',').map(Number).filter(Boolean)
+);
 
 if (!TOKEN) {
   console.warn("[Electro] ELECTRO_BOT_TOKEN nije postavljen — bot se ne pokreće.");
@@ -608,6 +611,10 @@ async function handleText(bot, chatId, text) {
 
 function handleMessage(bot, msg) {
   const chatId = msg.chat.id;
+
+  if (ALLOWED.size > 0 && !ALLOWED.has(chatId)) {
+    return bot.sendMessage(chatId, "⛔ Unauthorized.");
+  }
 
   if (OWNER_ID && msg.from.id !== OWNER_ID) {
     return bot.sendMessage(chatId, "⛔ Pristup odbijen.");
